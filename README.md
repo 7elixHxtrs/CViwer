@@ -1,4 +1,4 @@
-#CViwer
+# CViwer
 
 Visor ligero para ver tu capturadora (Xbox 360, PS3, Switch, etc.) **sin necesidad de OBS**, con muy poco consumo de recursos.
 
