@@ -1,0 +1,7 @@
+opencv-python
+numpy
+sounddevice
+pygrabber
+pillow
+pyinstaller
+imageio-ffmpeg
