@@ -26,7 +26,10 @@ except Exception:
     pass
 
 BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
-CFG_PATH = os.path.join(BASE, "config.json")
+HOME = os.path.expanduser("~")
+DATOS = os.path.join(os.environ.get("APPDATA") or HOME, "CViwer")  # la configuración vive aquí, no junto al .exe
+CFG_PATH = os.path.join(DATOS, "config.json")
+CFG_VIEJO = os.path.join(BASE, "config.json")  # versiones anteriores
 
 
 def recurso(nombre):
@@ -52,17 +55,22 @@ NEUTRO = {k: d for k, _, _, _, d in SLIDERS}
 
 # ---------------------------------------------------------------- utilidades
 def cargar_cfg():
-    try:
-        with open(CFG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    for ruta in (CFG_PATH, CFG_VIEJO):  # si solo existe la antigua, se migra
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return {}
 
 
 def guardar_cfg(cfg):
     try:
+        os.makedirs(os.path.dirname(CFG_PATH), exist_ok=True)
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
+        if os.path.exists(CFG_VIEJO):  # ya migrada: quitamos el archivo suelto junto al .exe
+            os.remove(CFG_VIEJO)
     except Exception:
         pass
 
@@ -352,8 +360,8 @@ class App:
         self.fin_hilo = None
         self.t_rec = 0.0
         self.secciones = {}
-        self.dirs = {"grab": self.cfg.get("dir_grab") or os.path.join(BASE, "Grabaciones"),
-                     "cap": self.cfg.get("dir_cap") or os.path.join(BASE, "Capturas")}
+        self.dirs = {"grab": self.cfg.get("dir_grab") or os.path.join(HOME, "Videos", "CViwer"),
+                     "cap": self.cfg.get("dir_cap") or os.path.join(HOME, "Pictures", "CViwer")}
         self.lbl_dir = {}
         self._panel_puesto = True
         self._aviso_job = None
