@@ -5,7 +5,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 if errorlevel 1 goto error
 echo === Creando el .exe ===
-python -m PyInstaller --onefile --noconsole --icon icono.ico --add-data "icono.png;." --name CViwer --collect-all pygrabber --collect-all sounddevice --collect-all imageio_ffmpeg --hidden-import comtypes.stream --hidden-import PIL._tkinter_finder cviwer.py
+python -m PyInstaller --onefile --noconsole --icon icono.ico --add-data "icono.png;." --name CViwer --collect-all pygrabber --collect-all sounddevice --collect-all imageio_ffmpeg --collect-all OpenGL --collect-all pyopengltk --hidden-import comtypes.stream --hidden-import PIL._tkinter_finder cviwer.py
 if errorlevel 1 goto error
 echo.
 echo Listo! Tu programa esta en la carpeta "dist": dist\CViwer.exe

@@ -5,3 +5,5 @@ pygrabber
 pillow
 pyinstaller
 imageio-ffmpeg
+PyOpenGL
+pyopengltk

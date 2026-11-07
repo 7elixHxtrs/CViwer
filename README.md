@@ -1,16 +1,17 @@
-# CViwer
+# 🎮 CViwer
 
 Visor ligero para ver tu capturadora (Xbox 360, PS3, Switch, etc.) **sin necesidad de OBS**, con muy poco consumo de recursos.
 
 ## Características
 
 - Video directo de cualquier capturadora USB (DirectShow) con audio de baja latencia
+- **Aceleración por GPU** (OpenGL): el escalado y los ajustes de color los hace la tarjeta gráfica, así que maximizar la ventana no baja los fps. Si la GPU no lo permite, cambia solo a un modo alternativo
 - Todo en una sola ventana, con menú que se oculta/muestra con **C**
 - Ajustes de color en vivo: brillo, contraste, gamma, saturación, tono, temperatura y volumen (en un panel desplegable)
 - **Grabación** en MP4 (H.264 + audio), con codificación por hardware si está disponible (NVIDIA / Intel / AMD)
 - Capturas de pantalla, pantalla completa, autodetección del audio de la capturadora
-- Eliges tú la carpeta donde se guardan las grabaciones y las capturas
-- Recuerda tu configuración
+- Eliges tú la carpeta donde se guardan las grabaciones y las capturas (por defecto `Videos\CViwer` y `Imágenes\CViwer`)
+- Recuerda tu configuración (se guarda en `%APPDATA%\CViwer`, sin ensuciar la carpeta del programa)
 
 ## Atajos
 

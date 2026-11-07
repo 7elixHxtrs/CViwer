@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 try:
     import sounddevice as sd
@@ -19,9 +19,20 @@ try:  # ffmpeg incluido (para grabar en H.264 con audio)
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG = shutil.which("ffmpeg")
-try:  # timers de 1 ms en Windows (video mas fluido)
+HAY_GL = False
+try:  # aceleracion por GPU (OpenGL): el escalado y los colores los hace la tarjeta grafica
+    from OpenGL import GL as gl
+    from OpenGL.GL import shaders as gl_shaders
+    from pyopengltk import OpenGLFrame
+    HAY_GL = True
+except Exception:
+    pass
+HAY_GDI = False
+try:  # timers de 1 ms en Windows (video mas fluido) y dibujo directo con GDI
     import ctypes
+    from ctypes import wintypes
     ctypes.windll.winmm.timeBeginPeriod(1)
+    HAY_GDI = True
 except Exception:
     pass
 
@@ -139,6 +150,221 @@ def adivinar_audio(video, entradas):
         if pts > mejor_pts:
             mejor, mejor_pts = pos, pts
     return mejor
+
+
+
+# ---------------------------------------------------------------- dibujo por GPU (OpenGL)
+if HAY_GL:
+    VERT = """#version 120
+varying vec2 uv;
+void main() { gl_Position = gl_Vertex; uv = gl_MultiTexCoord0.xy; }
+"""
+    FRAG = """#version 120
+uniform sampler2D tex;
+uniform float brillo, contraste, gamma_inv, sat, tono;
+uniform vec3 ganancia;
+varying vec2 uv;
+vec3 rgb2hsv(vec3 c) {
+    vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+void main() {
+    vec3 c = clamp(texture2D(tex, uv).rgb, 0.0, 1.0);
+    c = pow(c, vec3(gamma_inv));
+    c = (c - 0.5) * contraste + 0.5 + brillo;
+    c = clamp(c * ganancia, 0.0, 1.0);
+    if (sat != 1.0 || tono != 0.0) {
+        vec3 h = rgb2hsv(c);
+        h.y = clamp(h.y * sat, 0.0, 1.0);
+        h.x = fract(h.x + tono);
+        c = hsv2rgb(h);
+    }
+    gl_FragColor = vec4(c, 1.0);
+}
+"""
+    UNIFORMES = ("tex", "brillo", "contraste", "gamma_inv", "sat", "tono", "ganancia")
+
+    class VisorGL(OpenGLFrame):
+        """Superficie de video: sube el cuadro a la GPU y ella lo escala y le aplica el color."""
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.listo = self.fallo = False
+            self.prog = self.tex = self.loc = None
+            self.tam_tex = self.p = None
+
+        def initgl(self):  # lo llama pyopengltk al mostrarse y en cada cambio de tamano
+            if self.listo or self.fallo:
+                return
+            try:
+                self.prog = gl_shaders.compileProgram(
+                    gl_shaders.compileShader(VERT, gl.GL_VERTEX_SHADER),
+                    gl_shaders.compileShader(FRAG, gl.GL_FRAGMENT_SHADER), validate=False)
+                self.loc = {n: gl.glGetUniformLocation(self.prog, n) for n in UNIFORMES}
+                self.tex = gl.glGenTextures(1)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
+                for par, val in ((gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR), (gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR),
+                                 (gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE), (gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)):
+                    gl.glTexParameteri(gl.GL_TEXTURE_2D, par, val)
+                gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+                self.listo = True
+            except Exception:
+                self.fallo = True
+
+        def tkResize(self, evt):  # sin tocar OpenGL aqui; el viewport se ajusta al dibujar
+            self.width, self.height = evt.width, evt.height
+
+        def tkExpose(self, evt):  # Windows pide repintar (por ejemplo al maximizar): redibujamos el ultimo cuadro
+            if self.listo and self.tam_tex and self.p is not None:
+                try:
+                    self.tkMakeCurrent()
+                    self._pintar()
+                    self.tkSwapBuffers()
+                except Exception:
+                    pass
+
+        def redraw(self):
+            pass
+
+        def mostrar(self, frame, p):
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            self.tkMakeCurrent()
+            h, w = frame.shape[:2]
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
+            if self.tam_tex != (w, h):
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, frame)
+                self.tam_tex = (w, h)
+            else:
+                gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, w, h, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, frame)
+            self.p = p
+            self._pintar()
+            self.tkSwapBuffers()
+
+        def _pintar(self):
+            W, H = max(self.winfo_width(), 1), max(self.winfo_height(), 1)
+            tw, th = self.tam_tex
+            esc = min(W / tw, H / th)
+            dw, dh = max(1, int(tw * esc)), max(1, int(th * esc))
+            gl.glViewport(0, 0, W, H)
+            gl.glClearColor(0, 0, 0, 1)
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            gl.glViewport((W - dw) // 2, (H - dh) // 2, dw, dh)  # la GPU escala el video a este rectangulo
+            gl.glUseProgram(self.prog)
+            p, L = self.p, self.loc
+            gl.glUniform1i(L["tex"], 0)
+            gl.glUniform1f(L["brillo"], p["brillo"])
+            gl.glUniform1f(L["contraste"], p["contraste"])
+            gl.glUniform1f(L["gamma_inv"], p["gamma_inv"])
+            gl.glUniform1f(L["sat"], p["sat"])
+            gl.glUniform1f(L["tono"], p["tono"])
+            gl.glUniform3f(L["ganancia"], *p["ganancia"])
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
+            gl.glBegin(gl.GL_QUADS)
+            for x, y, s_, t_ in ((-1, -1, 0, 1), (1, -1, 1, 1), (1, 1, 1, 0), (-1, 1, 0, 0)):
+                gl.glTexCoord2f(s_, t_)
+                gl.glVertex2f(x, y)
+            gl.glEnd()
+            gl.glUseProgram(0)
+
+
+# ---------------------------------------------------------------- dibujo rapido (GDI de Windows)
+if HAY_GDI:
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD), ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", wintypes.LONG), ("biYPelsPerMeter", wintypes.LONG),
+                    ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD)]
+
+
+class GDI:
+    """Pinta el cuadro directamente en una ventana de Windows (mucho mas rapido que pasar por Tk)."""
+    def __init__(self, hwnd):
+        self.hwnd = hwnd
+        u, g = ctypes.windll.user32, ctypes.windll.gdi32
+        u.GetDC.argtypes, u.GetDC.restype = [wintypes.HWND], wintypes.HDC
+        u.ReleaseDC.argtypes, u.ReleaseDC.restype = [wintypes.HWND, wintypes.HDC], ctypes.c_int
+        g.StretchDIBits.argtypes = [wintypes.HDC] + [ctypes.c_int] * 8 + [
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT, wintypes.DWORD]
+        g.StretchDIBits.restype = ctypes.c_int
+        g.PatBlt.argtypes = [wintypes.HDC] + [ctypes.c_int] * 4 + [wintypes.DWORD]
+        g.PatBlt.restype = wintypes.BOOL
+        self.u, self.g, self.tam = u, g, None
+
+    def pintar(self, img, cw, ch):
+        """img: BGR contiguo, con ancho multiplo de 4. Se centra en el area (cw x ch)."""
+        h, w = img.shape[:2]
+        hdc = self.u.GetDC(self.hwnd)
+        if not hdc:
+            return
+        try:
+            if self.tam != (cw, ch, w, h):  # al cambiar de tamano, bordes negros limpios
+                self.g.PatBlt(hdc, 0, 0, cw, ch, 0x00000042)  # BLACKNESS
+                self.tam = (cw, ch, w, h)
+            bih = BITMAPINFOHEADER(40, w, -h, 1, 24, 0, 0, 0, 0, 0, 0)  # alto negativo = de arriba a abajo
+            img = np.ascontiguousarray(img)
+            self.g.StretchDIBits(hdc, (cw - w) // 2, (ch - h) // 2, w, h, 0, 0, w, h,
+                                 img.ctypes.data_as(ctypes.c_void_p), ctypes.byref(bih), 0, 0x00CC0020)  # SRCCOPY
+        finally:
+            self.u.ReleaseDC(self.hwnd, hdc)
+
+
+_FUENTES, _PARCHES = {}, {}
+
+
+def _fuente(tam, negrita):
+    k = (tam, negrita)
+    if k not in _FUENTES:
+        f = None
+        for nombre in (("segoeuib.ttf", "arialbd.ttf") if negrita else ("segoeui.ttf", "arial.ttf")):
+            try:
+                f = ImageFont.truetype(nombre, tam)
+                break
+            except Exception:
+                pass
+        _FUENTES[k] = f or ImageFont.load_default()
+    return _FUENTES[k]
+
+
+def parche_texto(texto, tam=16, negrita=False, punto=False):
+    """Imagen BGR pequena con el texto (fondo oscuro) para dibujarla encima del video."""
+    k = (texto, tam, negrita, punto)
+    if k in _PARCHES:
+        return _PARCHES[k]
+    font = _fuente(tam, negrita)
+    x0, y0, x1, y1 = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), texto, font=font)
+    extra = tam if punto else 0
+    w, h = x1 - x0 + 2 * 12 + extra, y1 - y0 + 2 * 7
+    im = Image.new("RGB", (w, h), (17, 17, 17))
+    d = ImageDraw.Draw(im)
+    if punto:
+        r = tam // 3
+        d.ellipse((12, h // 2 - r, 12 + 2 * r, h // 2 + r), fill=(255, 59, 48))
+    d.text((12 + extra - x0, 7 - y0), texto, font=font, fill=(255, 255, 255))
+    arr = np.ascontiguousarray(np.array(im)[:, :, ::-1])
+    if len(_PARCHES) > 60:
+        _PARCHES.clear()
+    _PARCHES[k] = arr
+    return arr
+
+
+def pegar(frame, parche, x, y):
+    ph, pw = parche.shape[:2]
+    fh, fw = frame.shape[:2]
+    if pw > fw or ph > fh:
+        return
+    x, y = max(0, min(x, fw - pw)), max(0, min(y, fh - ph))
+    frame[y:y + ph, x:x + pw] = parche
 
 
 class Camara:
@@ -360,6 +586,15 @@ class App:
         self.fin_hilo = None
         self.t_rec = 0.0
         self.secciones = {}
+        self.aviso_txt = self.rec_txt = ""
+        self.usar_gdi = HAY_GDI
+        self.gdi = None
+        self.usar_gl = HAY_GL
+        self.glf = None
+        self.n_crudo = self.n_pintado = 0
+        self.t_gl = 0.0
+        self.ultimo_par = (None, False)
+        self._cache_cap, self._cache_rec = {}, {}
         self.dirs = {"grab": self.cfg.get("dir_grab") or os.path.join(HOME, "Videos", "CViwer"),
                      "cap": self.cfg.get("dir_cap") or os.path.join(HOME, "Pictures", "CViwer")}
         self.lbl_dir = {}
@@ -478,6 +713,16 @@ class App:
                                               font=("Segoe UI", 13, "bold"))
         self.canvas.bind("<Configure>", self.al_redimensionar)
         self.canvas.bind("<Double-Button-1>", lambda e: self.pantalla_completa())
+        self.sup = tk.Frame(self.canvas, bg="#000000", highlightthickness=0, bd=0)  # superficie del video
+        self.sup.bind("<Double-Button-1>", lambda e: self.pantalla_completa())
+        self.sup.bind("<Configure>", lambda e: setattr(self, "canvas_size", (e.width, e.height)))
+        if self.usar_gl:
+            try:
+                self.glf = VisorGL(self.canvas, width=2, height=2)  # superficie con aceleracion por GPU
+                self.glf.bind("<Double-Button-1>", lambda e: self.pantalla_completa())
+                self.glf.bind("<Configure>", lambda e: setattr(self, "canvas_size", (e.width, e.height)), add="+")
+            except Exception:
+                self.usar_gl, self.glf = False, None
 
         main = self.panel
         ttk.Label(main, text="🎮  CViwer", style="Title.TLabel").pack(anchor="w")
@@ -591,6 +836,9 @@ class App:
         self.fs = (not self.fs) if valor is None else valor
         self.root.attributes("-fullscreen", self.fs)
         self.canvas.config(cursor="none" if self.fs else "arrow")
+        self.sup.config(cursor="none" if self.fs else "arrow")
+        if self.glf:
+            self.glf.config(cursor="none" if self.fs else "arrow")
         self.aplicar_panel()
         if self.fs:
             self.aviso("Esc para salir de pantalla completa")
@@ -612,6 +860,7 @@ class App:
         self._panel_puesto = mostrar
 
     def aviso(self, texto, ms=2500):
+        self.aviso_txt = texto
         self.canvas.itemconfig(self.aviso_id, text=texto)
         x1, y1, x2, y2 = self.canvas.bbox(self.aviso_id)
         self.canvas.coords(self.aviso_bg, x1 - 12, y1 - 6, x2 + 12, y2 + 6)
@@ -623,6 +872,7 @@ class App:
         self._aviso_job = self.root.after(ms, self.quitar_aviso)
 
     def quitar_aviso(self):
+        self.aviso_txt = ""
         self.canvas.itemconfig(self.aviso_id, text="")
         self.canvas.itemconfig(self.aviso_bg, state="hidden")
 
@@ -631,7 +881,7 @@ class App:
             return
         try:
             ruta = os.path.join(self.asegurar_dir("cap"), time.strftime("captura_%Y%m%d_%H%M%S.png"))
-            ok, buf = cv2.imencode(".png", self.ultimo)  # (imwrite falla con acentos en la ruta)
+            ok, buf = cv2.imencode(".png", self.cuadro_final(self._cache_cap))  # (imwrite falla con acentos en la ruta)
             if not ok:
                 raise RuntimeError("No se pudo codificar la imagen.")
             buf.tofile(ruta)
@@ -778,7 +1028,7 @@ class App:
         audio = self.audio_info if self.audio else None
         try:
             ruta = os.path.join(self.asegurar_dir("grab"), time.strftime("grabacion_%Y%m%d_%H%M%S.mp4"))
-            self.grabador = Grabador(ruta, w, h, fps, lambda: self.ultimo, audio)
+            self.grabador = Grabador(ruta, w, h, fps, lambda: self.cuadro_final(self._cache_rec), audio)
         except Exception as e:
             self.grabador = None
             messagebox.showerror("No se pudo grabar", str(e))
@@ -813,6 +1063,8 @@ class App:
             t = int(time.time() - self.t_rec)
             txt = f"●  REC  {t // 3600:02d}:{t // 60 % 60:02d}:{t % 60:02d}" if t >= 3600 else \
                   f"●  REC  {t // 60:02d}:{t % 60:02d}"
+            self.rec_txt = f"REC  {t // 60:02d}:{t % 60:02d}" if t < 3600 else \
+                f"REC  {t // 3600:02d}:{t // 60 % 60:02d}:{t % 60:02d}"
             self.canvas.itemconfig(self.rec_id, text=txt)
             x1, y1, x2, y2 = self.canvas.bbox(self.rec_id)
             self.canvas.coords(self.rec_bg, x1 - 10, y1 - 5, x2 + 10, y2 + 5)
@@ -820,6 +1072,7 @@ class App:
             self.canvas.tag_raise(self.rec_bg)
             self.canvas.tag_raise(self.rec_id)
         else:
+            self.rec_txt = ""
             self.canvas.itemconfig(self.rec_id, text="")
             self.canvas.itemconfig(self.rec_bg, state="hidden")
 
@@ -835,6 +1088,8 @@ class App:
         _, w, h, fps = RESOLUCIONES[max(0, self.cb["res"].current())]
         self.msg = ""
         self.running = True
+        self.ultimo, self.ultimo_par, self.n_crudo, self.n_pintado = None, (None, False), 0, 0
+        self.preparar_superficie()
         self.thread = threading.Thread(target=self.bucle_video, args=(max(ci, 0), w, h, fps), daemon=True)
         self.thread.start()
         self.iniciar_audio()
@@ -849,6 +1104,7 @@ class App:
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2)
         self.parar_audio()
+        self.ocultar_superficies()
         self.latest = self.pintado = self.photo = None
         self.canvas.itemconfig(self.img_id, image="")
         self.canvas.itemconfig(self.txt_id, text="Elige tu capturadora y pulsa  ▶ Iniciar")
@@ -860,8 +1116,60 @@ class App:
             messagebox.showwarning("Aviso", self.msg)
             self.msg = ""
 
+    def ocultar_superficies(self):
+        self.sup.place_forget()
+        if self.glf:
+            self.glf.place_forget()
+
+    def preparar_superficie(self):
+        """Elige cómo se dibuja el video: GPU (OpenGL) > GDI > Tk, con respaldo automático."""
+        self.ocultar_superficies()
+        if self.usar_gl and self.glf:
+            self.glf.place(x=0, y=0, relwidth=1, relheight=1)
+            self.t_gl = time.time()
+        elif self.usar_gdi:
+            try:
+                self.sup.place(x=0, y=0, relwidth=1, relheight=1)
+                self.root.update_idletasks()
+                self.gdi = GDI(self.sup.winfo_id())
+            except Exception:
+                self.usar_gdi = False
+                self.sup.place_forget()
+
+    def fallar_gl(self):
+        self.usar_gl = False
+        self.preparar_superficie()
+        self.status_txt = "La aceleración por GPU no está disponible; usando el modo alternativo."
+
+    def params_gl(self):
+        c = self.color
+        t = c["temperatura"] / 300.0
+        return {"brillo": c["brillo"] / 200.0, "contraste": c["contraste"] / 100.0,
+                "gamma_inv": 100.0 / max(c["gamma"], 10), "sat": c["saturacion"] / 100.0,
+                "tono": c["tono"] / 180.0, "ganancia": (1.0 + t, 1.0, 1.0 - t)}
+
+    def cuadro_final(self, cache):
+        """Cuadro con los ajustes de color aplicados (para grabar y capturar)."""
+        f, procesado = self.ultimo_par
+        if f is None:
+            return None
+        return f if procesado else procesar(f, dict(self.color), cache)
+
+    def dibujar_gdi(self, g, copiado, cw, ch):
+        if self.rec_txt or self.aviso_txt:
+            if not copiado:
+                g = g.copy()  # no tocar el cuadro original (se usa para grabar y capturar)
+            fh, fw = g.shape[:2]
+            if self.rec_txt:
+                p = parche_texto(self.rec_txt, 18, True, True)
+                pegar(g, p, fw - p.shape[1] - 20, 20)
+            if self.aviso_txt:
+                p = parche_texto(self.aviso_txt, 16)
+                pegar(g, p, (fw - p.shape[1]) // 2, fh - p.shape[0] - 30)
+        self.gdi.pintar(g, cw, ch)
+
     def bucle_video(self, idx, w, h, fps):
-        """Hilo: toma el cuadro, aplica el color y lo escala al tamano del visor."""
+        """Hilo: toma el cuadro, aplica el color, lo escala y lo pinta."""
         cam = Camara(idx, w, h, fps)
         if not cam.ok:
             self.msg = "No se pudo abrir la capturadora.\n¿Está en uso por OBS u otro programa?"
@@ -869,38 +1177,71 @@ class App:
             return
         mostrado, cache = -1, {}
         while self.running:
+            if self.usar_gl:  # GPU: aquí solo se entrega el cuadro crudo; la tarjeta gráfica hace el resto
+                if cam.frame is not None and cam.n != mostrado:
+                    mostrado = cam.n
+                    f = cam.frame
+                    self.ultimo, self.ultimo_par, self.n_crudo = f, (f, False), mostrado
+                else:
+                    time.sleep(0.002)
+                continue
             if cam.frame is not None and cam.n != mostrado:
                 mostrado = cam.n
                 f = procesar(cam.frame, dict(self.color), cache)
-                self.ultimo = f
+                self.ultimo, self.ultimo_par = f, (f, True)
                 cw, ch = self.canvas_size
                 if cw > 10 and ch > 10:
                     fh, fw = f.shape[:2]
                     esc = min(cw / fw, ch / fh)
-                    nw, nh = max(2, int(fw * esc)), max(2, int(fh * esc))
-                    if (nw, nh) != (fw, fh):
-                        f = cv2.resize(f, (nw, nh), interpolation=cv2.INTER_LINEAR)
-                    self.latest = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+                    gdi = self.usar_gdi
+                    nw = max(4, int(fw * esc) // 4 * 4) if gdi else max(2, int(fw * esc))  # GDI: ancho multiplo de 4
+                    nh = max(2, int(fh * esc))
+                    copiado = (nw, nh) != (fw, fh)
+                    g = cv2.resize(f, (nw, nh), interpolation=cv2.INTER_LINEAR) if copiado else f
+                    if gdi:
+                        try:
+                            self.dibujar_gdi(g, copiado, cw, ch)
+                            self.contador += 1
+                        except Exception:
+                            self.usar_gdi = False  # si falla, se usa el metodo lento (Tk)
+                    else:
+                        self.latest = cv2.cvtColor(g, cv2.COLOR_BGR2RGB)
             else:
                 time.sleep(0.002)
         self.running = False
         cam.cerrar()
 
     # ---- bucles de la interfaz
+    def tick_gl(self):
+        g = self.glf
+        if g.fallo or (not g.listo and time.time() - self.t_gl > 3):
+            self.fallar_gl()
+            return
+        if g.listo and self.n_crudo != self.n_pintado and self.ultimo is not None:
+            self.n_pintado = self.n_crudo
+            try:
+                g.mostrar(self.ultimo, self.params_gl())
+                self.contador += 1
+            except Exception:
+                self.fallar_gl()
+
     def tick(self):
-        lat = self.latest
-        if self.running and lat is not None and lat is not self.pintado:
-            self.pintado = lat
-            h, w = lat.shape[:2]
-            img = Image.fromarray(lat)
-            if self.photo is None or self.photo.width() != w or self.photo.height() != h:
-                self.photo = ImageTk.PhotoImage(img)
-                self.canvas.itemconfig(self.img_id, image=self.photo)
-                self.canvas.itemconfig(self.txt_id, text="")
-            else:
-                self.photo.paste(img)
-            self.contador += 1
-        self.root.after(4, self.tick)
+        if self.running and self.usar_gl and self.glf:
+            self.tick_gl()
+        else:
+            lat = self.latest
+            if self.running and lat is not None and lat is not self.pintado:
+                self.pintado = lat
+                h, w = lat.shape[:2]
+                img = Image.fromarray(lat)
+                if self.photo is None or self.photo.width() != w or self.photo.height() != h:
+                    self.photo = ImageTk.PhotoImage(img)
+                    self.canvas.itemconfig(self.img_id, image=self.photo)
+                    self.canvas.itemconfig(self.txt_id, text="")
+                else:
+                    self.photo.paste(img)
+                self.contador += 1
+        self.root.after(2, self.tick)
 
     def poll(self):
         if self.flag_reset:
@@ -916,7 +1257,10 @@ class App:
             self.status.configure(text=self.status_txt)
             self.status_txt = ""
         elif self.running and self.fps > 1 and not self.finalizando:
-            self.status.configure(text=f"▶ Reproduciendo · {self.fps:.0f} fps")
+            gpu = " · GPU" if (self.usar_gl and self.glf and self.glf.listo) else ""
+            self.status.configure(text=f"▶ Reproduciendo · {self.fps:.0f} fps{gpu}")
+        if not self.usar_gl and not self.usar_gdi and self.sup.winfo_manager():
+            self.sup.place_forget()
         self.actualizar_rec()
         self.root.after(250, self.poll)
 
